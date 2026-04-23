@@ -93,6 +93,32 @@ class BagMetadataExtractor:
         return timestamps
 
 
+def _load_saved_timestamp_range(path: str, label: str) -> Tuple[Optional[int], Optional[int]]:
+    """Load the min/max timestamp from a saved pose dictionary."""
+    if not os.path.exists(path):
+        print(f"Missing {label} file: {path}")
+        return None, None
+
+    try:
+        poses = np.load(path, allow_pickle=True).item()
+    except Exception as exc:
+        print(f"Failed to load {label} timestamps from {path}: {exc}")
+        return None, None
+
+    if not poses:
+        print(f"{label} file is empty: {path}")
+        return None, None
+
+    timestamps = sorted(int(ts) for ts in poses.keys())
+    start_ns = timestamps[0]
+    end_ns = timestamps[-1]
+    print(
+        f"{label} time range: {start_ns} to {end_ns} ns "
+        f"({(end_ns - start_ns) / 1e9:.1f} seconds)"
+    )
+    return start_ns, end_ns
+
+
 class PoseQueryEngine:
     """
     Query system for timestamp-based pose lookup with SLERP interpolation for rotations.
@@ -115,6 +141,13 @@ class PoseQueryEngine:
         """
         try:
             loaded_poses = np.load(poses_file, allow_pickle=True).item()
+            # Legacy artifacts stored (4x4 matrix, velocity) tuples instead of
+            # pure 4x4 matrices. Transparently unwrap them so old files still
+            # work with the interpolation code downstream.
+            loaded_poses = {
+                ts: (pose[0] if isinstance(pose, tuple) else pose)
+                for ts, pose in loaded_poses.items()
+            }
             self.continuous_poses.update(loaded_poses)
             print(f"Loaded {len(loaded_poses)} continuous poses from {poses_file}")
             return True
@@ -268,6 +301,18 @@ class PoseQueryEngine:
 # FIXME(yuance): Update database path
 TINYNAV_DB = "tinynav_db"
 
+# Raw sensor topics that perception_node needs from the bag. All other recorded
+# topics (e.g. /slam/odometry, /mapping/*, /planning/*) would collide with live
+# outputs produced by perception_node/map_node and must NOT be replayed.
+RAW_SENSOR_TOPICS = [
+    "/camera/camera/imu",
+    "/camera/camera/infra1/image_rect_raw",
+    "/camera/camera/infra1/camera_info",
+    "/camera/camera/infra2/image_rect_raw",
+    "/camera/camera/infra2/camera_info",
+    "/tf",
+    "/tf_static",
+]
 
 def generate_launch_description_localization(
     bag_path: str,
@@ -309,6 +354,9 @@ def generate_launch_description_localization(
         name=f"{task_name}_localization",
         output="screen",
     )
+    # Only replay raw sensor topics so the recorded /slam/odometry,
+    # /mapping/* etc. do not collide with the live outputs that perception_node
+    # and map_node produce during this run.
     bag_play = ExecuteProcess(
         cmd=[
             "ros2",
@@ -318,6 +366,8 @@ def generate_launch_description_localization(
             "--rate",
             str(rate),
             "--clock",
+            "--topics",
+            *RAW_SENSOR_TOPICS,
         ],  # no --loop so it will exit at EOF
         output="screen",
     )
@@ -378,6 +428,11 @@ def generate_launch_description_mapping(
         str(bag_path),
         "--tinynav_temp_path",
         f"{map_save_path}/tinynav_temp",
+        # Pace BagPlayer so perception_node can warm up and actually emit
+        # keyframes; without this the bag drains in a few seconds and
+        # poses.npy ends up empty.
+        "--realtime_rate",
+        str(rate),
     ]
     if not verbose_timer:
         mapping_cmd.append("--no_verbose_timer")
@@ -712,18 +767,42 @@ class BenchmarkResults:
         print(f"Results saved to {output_dir}")
 
 
-def sample_timestamps_from_bag(bag_path: str, num_samples: int) -> np.ndarray:
-    start_time, end_time = BagMetadataExtractor.get_bag_time_range(bag_path)
+def sample_timestamps_from_saved_results(
+    map_result_dir_b: str, num_samples: int
+) -> np.ndarray:
+    """Sample timestamps in the shared header.stamp time domain of saved outputs."""
+    range_specs = [
+        (
+            "continuous odom",
+            os.path.join(map_result_dir_b, "localization_continuous_odom.npy"),
+        ),
+        ("keyframe poses", os.path.join(map_result_dir_b, "poses.npy")),
+        (
+            "relocalization poses",
+            os.path.join(map_result_dir_b, "relocalization_poses.npy"),
+        ),
+    ]
 
-    if None in [start_time, end_time]:
-        raise RuntimeError("Failed to extract time ranges from bags")
+    ranges = []
+    for label, path in range_specs:
+        start_ns, end_ns = _load_saved_timestamp_range(path, label)
+        if start_ns is None or end_ns is None:
+            raise RuntimeError(f"Failed to extract {label} time range")
+        ranges.append((start_ns, end_ns))
+
+    start_time = max(start_ns for start_ns, _ in ranges)
+    end_time = min(end_ns for _, end_ns in ranges)
+    if start_time >= end_time:
+        raise RuntimeError(
+            "Saved pose time ranges do not overlap: "
+            f"start={start_time}, end={end_time}"
+        )
 
     timestamps = BagMetadataExtractor.sample_timestamps_evenly(
         start_time, end_time, num_samples
     )
-    print(f"Sampled {len(timestamps)} timestamps from overlapping time range")
+    print(f"Sampled {len(timestamps)} timestamps from saved pose overlap")
     print(f"Time range: {(end_time - start_time) / 1e9:.1f} seconds")
-
     return timestamps
 
 
@@ -739,7 +818,7 @@ def query_poses_at_timestamps(
 
     Returns:
         Tuple of (ground_truth_poses, localization_poses) dictionaries
-        - ground_truth_poses: From bag B's mapping (keyframe + odom delta)
+        - ground_truth_poses: From bag B's local pose graph (keyframe + odom delta)
         - localization_poses: From bag B's localization in map A (relocalization + odom delta)
     """
     ground_truth_poses = {}
@@ -848,7 +927,7 @@ def run_mapping_process(
     verbose_timer: bool,
 ) -> bool:
     ld = generate_launch_description_mapping(
-        bag_path, map_save_path, rate, data_saving_timeout, "mapping", verbose_timer
+        bag_path, map_save_path, rate, data_saving_timeout, "mapping", verbose_timer,
     )
     ls = LaunchService()
     ls.include_launch_description(ld)
@@ -887,6 +966,7 @@ def run_benchmark(
     num_samples: int,
     timeout: float,
     verbose_timer: bool = False,
+    map_a_path: Optional[str] = None,
 ) -> bool:
     """
     Run benchmark using timestamp-based sampling instead of keyframe-based.
@@ -897,6 +977,7 @@ def run_benchmark(
         output_dir: Output directory for results
         rate: Playback rate for bags
         num_samples: Number of timestamps to sample for evaluation
+        map_a_path: If set, skip Step 1 and reuse an existing map directory as map A.
 
     Returns:
         True if successful, False otherwise
@@ -907,23 +988,29 @@ def run_benchmark(
     print(f"Playback rate: {rate}x")
     print(f"Number of samples: {num_samples}")
 
-    map_result_dir_a = f"{output_dir}/benchmark_map_a"
-    os.makedirs(map_result_dir_a, exist_ok=True)
+    if map_a_path is not None:
+        # Reuse an existing map directory; do not touch it.
+        map_result_dir_a = map_a_path
+        print(f"Reusing existing map A at: {map_result_dir_a} (Step 1 skipped)")
+    else:
+        map_result_dir_a = f"{output_dir}/benchmark_map_a"
+        os.makedirs(map_result_dir_a, exist_ok=True)
     map_result_dir_b = f"{output_dir}/benchmark_map_b"
     os.makedirs(map_result_dir_b, exist_ok=True)
 
     results = BenchmarkResults()
 
-    print("\nStep 1: Creating map A from bag A as reference...")
-    if not run_mapping_process(
-        bag_a_path,
-        map_save_path=map_result_dir_a,
-        rate=rate,
-        data_saving_timeout=timeout,
-        verbose_timer=verbose_timer,
-    ):
-        print("Error: Failed to create map A")
-        return False
+    if map_a_path is None:
+        print("\nStep 1: Creating map A from bag A as reference...")
+        if not run_mapping_process(
+            bag_a_path,
+            map_save_path=map_result_dir_a,
+            rate=rate,
+            data_saving_timeout=timeout,
+            verbose_timer=verbose_timer,
+        ):
+            print("Error: Failed to create map A")
+            return False
 
     print("\nStep 2: Localizing bag B in map A...")
     if not run_localization_process(
@@ -937,8 +1024,10 @@ def run_benchmark(
         print("Error: Failed to localize bag B in map A")
         return False
 
-    print(f"\nStep 3: Sampling {num_samples} timestamps from bag time ranges...")
-    sampled_timestamps = sample_timestamps_from_bag(bag_b_path, num_samples)
+    print(f"\nStep 3: Sampling {num_samples} timestamps from saved pose time ranges...")
+    sampled_timestamps = sample_timestamps_from_saved_results(
+        map_result_dir_b, num_samples
+    )
 
     if sampled_timestamps is None or len(sampled_timestamps) == 0:
         print("Error: Timestamp sampling failed")
@@ -1030,6 +1119,15 @@ def main():
         help="Disable verbose timer output for nodes (default)",
     )
     parser.set_defaults(verbose_timer=False)
+    parser.add_argument(
+        "--map_a_path",
+        default=None,
+        help=(
+            "If set, skip Step 1 (mapping of bag A) and reuse this directory "
+            "as map A. Must contain poses.npy, intrinsics.npy, embeddings.db, "
+            "etc. produced by build_map_node."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1045,6 +1143,10 @@ def main():
         print("Error: Rate must be positive")
         return 1
 
+    if args.map_a_path is not None and not os.path.isdir(args.map_a_path):
+        print(f"Error: --map_a_path does not exist: {args.map_a_path}")
+        return 1
+
     benchmark_return = run_benchmark(
         args.bag_a,
         args.bag_b,
@@ -1053,6 +1155,7 @@ def main():
         args.num_images,
         args.timeout,
         args.verbose_timer,
+        map_a_path=args.map_a_path,
     )
     if benchmark_return:
         print("\nBenchmark completed!")

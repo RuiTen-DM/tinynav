@@ -588,9 +588,15 @@ def main(args=None):
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(perception_node)
-    executor.spin()
-    perception_node.destroy_node()
-    executor.shutdown()
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        perception_node.destroy_node()
+        executor.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

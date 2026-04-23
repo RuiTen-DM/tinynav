@@ -29,7 +29,8 @@ import shelve
 from tqdm import tqdm
 import einops
 from tf2_msgs.msg import TFMessage
-from typing import Dict
+from typing import Dict, Optional
+import time
 
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped,Point
@@ -217,7 +218,8 @@ class OdomPoseRecorder:
         timestamp_ns = int(odom_msg.header.stamp.sec * 1e9) + int(
             odom_msg.header.stamp.nanosec
         )
-        pose_matrix = msg2np(odom_msg)
+        # msg2np returns (T_4x4, velocity_3); only the pose matrix is needed here.
+        pose_matrix, _ = msg2np(odom_msg)
         self.poses[timestamp_ns] = pose_matrix
 
     def save_to_disk(self) -> None:
@@ -299,6 +301,7 @@ class TinyNavDB():
 
 class BagPlayer(Node):
     def __init__(self, bag_uri: str, storage_id: str = "sqlite3", serialization_format: str = "cdr",
+                 realtime_rate: float = 0.0,
     ):
         super().__init__("rosbag_player")
 
@@ -310,6 +313,13 @@ class BagPlayer(Node):
 
         self.start_timestamp_ns = None
         self.end_timestamp_ns = None
+
+        # When realtime_rate > 0, play_next() paces publishing against wall
+        # clock so perception_node has time to warm up and process frames. When
+        # 0, behavior matches the legacy "drain as fast as possible" loop.
+        self._realtime_rate = float(realtime_rate)
+        self._play_wall_start: Optional[float] = None
+        self._play_bag_start_ns: Optional[int] = None
 
         topic_infos = self._reader.get_all_topics_and_types()
         if len(topic_infos) == 0:
@@ -381,6 +391,20 @@ class BagPlayer(Node):
 
         topic, serialized_msg, timestamp_ns = self._reader.read_next()
         self._publish_percent_from_timestamp(int(timestamp_ns))
+
+        # Wall-clock pacing: hold messages back so the bag takes roughly its
+        # recorded duration (divided by realtime_rate) to play out. This is
+        # needed when a heavy downstream node (perception_node) must keep up.
+        if self._realtime_rate > 0.0:
+            if self._play_wall_start is None:
+                self._play_wall_start = time.monotonic()
+                self._play_bag_start_ns = int(timestamp_ns)
+            else:
+                bag_elapsed_s = (int(timestamp_ns) - self._play_bag_start_ns) / 1e9
+                target_wall = self._play_wall_start + bag_elapsed_s / self._realtime_rate
+                sleep_s = target_wall - time.monotonic()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
 
         # Find publisher + msg type for this topic
         pub_and_type = self._topic_publishers.get(topic)
@@ -839,10 +863,13 @@ def main(args=None):
     parser.add_argument("--map_save_path", type=str, default="tinynav_db")
     parser.add_argument("--verbose_timer", action="store_true", default=True, help="Enable verbose timer output")
     parser.add_argument("--no_verbose_timer", dest="verbose_timer", action="store_false", help="Disable verbose timer output")
+    parser.add_argument("--realtime_rate", type=float, default=0.0,
+                        help="If >0, pace BagPlayer against wall clock at this rate (1.0 = real-time). "
+                             "Default 0 keeps legacy max-throughput playback.")
     parsed_args, unknown_args = parser.parse_known_args(sys.argv[1:])
 
     exec_ = SingleThreadedExecutor()
-    player_node = BagPlayer(parsed_args.bag_file)
+    player_node = BagPlayer(parsed_args.bag_file, realtime_rate=parsed_args.realtime_rate)
     bag_topics = set(player_node._topic_publishers.keys())
     has_rgb = '/camera/camera/color/image_raw' in bag_topics or '/camera/camera/color/image_rect_raw/compressed' in bag_topics
     has_compressed_rgb = '/camera/camera/color/image_rect_raw/compressed' in bag_topics
