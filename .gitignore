@@ -123,6 +123,8 @@ dmypy.json
 
 # VSCode
 .vscode/
+.codex/
+.codex
 
 # TensorRT engine files
 *.engine

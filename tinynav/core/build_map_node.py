@@ -271,7 +271,7 @@ class TinyNavDB():
         self.depths = IntKeyShelf(f"{map_save_path}/depths")
         self.rgb_images = IntKeyShelf(f"{map_save_path}/rgb_images")
 
-    def set_entry(self, key:int,   depth:np.ndarray = None, embedding:np.ndarray = None, features:dict = None,  infra1_image:np.ndarray = None, rgb_image:np.ndarray = None):
+    def set_entry(self, key:int, depth=None, embedding=None, features=None, infra1_image=None, rgb_image=None):
         if infra1_image is not None:
             self.infra1_images[key] = infra1_image
         if rgb_image is not None:
@@ -284,7 +284,8 @@ class TinyNavDB():
             self.features[key] = features
 
     def get_depth_embedding_features_images(self, key:int):
-        return self.depths[key], self.embeddings[key], self.features[key], self.rgb_images[key], self.infra1_images[key]
+        rgb_image = self.rgb_images[key] if key in self.rgb_images else None
+        return self.depths[key], self.embeddings[key], self.features[key], rgb_image, self.infra1_images[key]
 
     def get_embedding(self, key:int):
         return self.embeddings[key]
@@ -404,9 +405,10 @@ class BagPlayer(Node):
         return True
 
 class BuildMapNode(Node):
-    def __init__(self, map_save_path:str, verbose_timer: bool = True):
+    def __init__(self, map_save_path:str, verbose_timer: bool = True, has_rgb: bool = True):
         super().__init__('build_map_node')
         self.verbose_timer = verbose_timer
+        self.has_rgb = has_rgb
         self.logger = logging.getLogger(__name__)
         self.timer_logger = self.logger.info if verbose_timer else self.logger.debug
         self.super_point_extractor = SuperPointTRT()
@@ -421,7 +423,6 @@ class BuildMapNode(Node):
         self.depth_sub = Subscriber(self, Image, '/slam/keyframe_depth')
         self.keyframe_image_sub = Subscriber(self, Image, '/slam/keyframe_image')
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
-        self.rgb_image_sub = Subscriber(self, Image, '/camera/camera/color/image_raw')
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/mapping/pointcloud_markers', 10)
@@ -436,8 +437,14 @@ class BuildMapNode(Node):
         self.mapping_stop_sub = self.create_subscription(Bool, '/benchmark/stop', self.mapping_stop_callback, 10)
         self.mapping_save_finished_pub = self.create_publisher(Bool, '/benchmark/data_saved', 10)
         # Keep sync queue bounded to reduce memory spikes/OOM risk on Jetson during map building.
-        self.ts = ApproximateTimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub, self.rgb_image_sub], 200, 0.02)
-        self.ts.registerCallback(self.keyframe_callback)
+        if self.has_rgb:
+            self.rgb_image_sub = Subscriber(self, Image, '/camera/camera/color/image_raw')
+            self.ts = ApproximateTimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub, self.rgb_image_sub], 200, 0.02)
+            self.ts.registerCallback(self.keyframe_callback)
+        else:
+            self.rgb_image_sub = None
+            self.ts = ApproximateTimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub], 200, 0.02)
+            self.ts.registerCallback(self.keyframe_callback_no_rgb)
 
         self.K = None
         self.baseline = None
@@ -462,9 +469,12 @@ class BuildMapNode(Node):
         self.tf_static_sub = Subscriber(self, TFMessage, "/tf_static")
         self.tf_static_sub.registerCallback(self.tf_callback)
         self.T_rgb_to_infra1 = None
-        self.rgb_camera_info_sub = Subscriber(self, CameraInfo, "/camera/camera/color/camera_info")
-        self.rgb_camera_info_sub.registerCallback(self.rgb_camera_info_callback)
         self.rgb_camera_K = None
+        if self.has_rgb:
+            self.rgb_camera_info_sub = Subscriber(self, CameraInfo, "/camera/camera/color/camera_info")
+            self.rgb_camera_info_sub.registerCallback(self.rgb_camera_info_callback)
+        else:
+            self.rgb_camera_info_sub = None
 
     def tf_callback(self, msg:TFMessage):
         T_infra1_to_link = None
@@ -493,7 +503,8 @@ class BuildMapNode(Node):
 
         if T_infra1_optical_to_infra1 is not None and T_rgb_optical_to_rgb is not None and T_infra1_to_link is not None and T_rgb_to_link is not None:
             self.T_rgb_to_infra1 = np.linalg.inv(T_infra1_optical_to_infra1) @ np.linalg.inv(T_infra1_to_link) @ T_rgb_to_link @ T_rgb_optical_to_rgb
-        if tf_messages and self.T_rgb_to_infra1 is not None:
+        rgb_ready = (not self.has_rgb) or (self.T_rgb_to_infra1 is not None)
+        if tf_messages and rgb_ready:
             np.save(f"{self.map_save_path}/tf_messages.npy", tf_messages, allow_pickle=True)
             if self.tf_sub is not None:
                 self.destroy_subscription(self.tf_sub.sub)
@@ -545,7 +556,13 @@ class BuildMapNode(Node):
                 return
             self.process(keyframe_image_msg, keyframe_odom_msg, depth_msg, rgb_image_msg)
 
-    def process(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg:Image):
+    def keyframe_callback_no_rgb(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
+        with Timer(name="Mapping Loop", text="[{name}] Elapsed time: {milliseconds:.0f} ms\n\n", logger=self.timer_logger):
+            if self.K is None:
+                return
+            self.process(keyframe_image_msg, keyframe_odom_msg, depth_msg, None)
+
+    def process(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg):
         with Timer(name = "Msg decode", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             keyframe_image_timestamp = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
             keyframe_odom_timestamp = int(keyframe_odom_msg.header.stamp.sec * 1e9) + int(keyframe_odom_msg.header.stamp.nanosec)
@@ -556,7 +573,7 @@ class BuildMapNode(Node):
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
             odom, _ = msg2np(keyframe_odom_msg)
             infra1_image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
-            rgb_image = self.bridge.imgmsg_to_cv2(rgb_image_msg, desired_encoding="bgr8")
+            rgb_image = self.bridge.imgmsg_to_cv2(rgb_image_msg, desired_encoding="bgr8") if rgb_image_msg is not None else None
 
         with Timer(name = "save image and depth", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             self.db.set_entry(keyframe_image_timestamp, depth = depth, infra1_image = infra1_image, rgb_image = rgb_image)
@@ -671,9 +688,11 @@ class BuildMapNode(Node):
         np.save(f"{self.map_save_path}/poses.npy", self.pose_graph_used_pose, allow_pickle = True)
         np.save(f"{self.map_save_path}/intrinsics.npy", self.K)
         np.save(f"{self.map_save_path}/baseline.npy", self.baseline)
-        print(f"T_rgb_to_infra1: {self.T_rgb_to_infra1}")
-        np.save(f"{self.map_save_path}/T_rgb_to_infra1.npy", self.T_rgb_to_infra1, allow_pickle = True)
-        np.save(f"{self.map_save_path}/rgb_camera_intrinsics.npy", self.rgb_camera_K, allow_pickle = True)
+        if self.has_rgb and self.T_rgb_to_infra1 is not None:
+            print(f"T_rgb_to_infra1: {self.T_rgb_to_infra1}")
+            np.save(f"{self.map_save_path}/T_rgb_to_infra1.npy", self.T_rgb_to_infra1, allow_pickle = True)
+        if self.has_rgb and self.rgb_camera_K is not None:
+            np.save(f"{self.map_save_path}/rgb_camera_intrinsics.npy", self.rgb_camera_K, allow_pickle = True)
         # Generate occupancy map
         occupancy_resolution = 0.05
         occupancy_step = 10
@@ -824,11 +843,17 @@ def main(args=None):
 
     exec_ = SingleThreadedExecutor()
     player_node = BagPlayer(parsed_args.bag_file)
-    map_node = BuildMapNode(parsed_args.map_save_path, verbose_timer=parsed_args.verbose_timer)
-    image_transports_node = ImageTransportsNode()
+    bag_topics = set(player_node._topic_publishers.keys())
+    has_rgb = '/camera/camera/color/image_raw' in bag_topics or '/camera/camera/color/image_rect_raw/compressed' in bag_topics
+    has_compressed_rgb = '/camera/camera/color/image_rect_raw/compressed' in bag_topics
+    if not has_rgb:
+        player_node.get_logger().info("Bag has no RGB topics; building grayscale-only map.")
+    map_node = BuildMapNode(parsed_args.map_save_path, verbose_timer=parsed_args.verbose_timer, has_rgb=has_rgb)
     exec_.add_node(player_node)
     exec_.add_node(map_node)
-    exec_.add_node(image_transports_node)
+    if has_compressed_rgb:
+        image_transports_node = ImageTransportsNode()
+        exec_.add_node(image_transports_node)
     while rclpy.ok() and player_node.play_next():
         exec_.spin_once(timeout_sec=0.001)
     player_node._publish_percent(100.0)
