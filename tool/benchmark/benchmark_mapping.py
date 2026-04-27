@@ -1,6 +1,8 @@
 import os
 import argparse
 import json
+import subprocess
+import sys
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -1128,6 +1130,17 @@ def main():
             "etc. produced by build_map_node."
         ),
     )
+    parser.add_argument(
+        "--rviz",
+        action="store_true",
+        default=False,
+        help=(
+            "After the benchmark finishes, launch benchmark_rviz_publisher.py "
+            "to publish results to RViz on the host machine. "
+            "Requires --network host when running inside Docker. "
+            "Blocks until Ctrl+C."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1161,6 +1174,17 @@ def main():
         print("\nBenchmark completed!")
     else:
         print("\nBenchmark failed!")
+
+    if args.rviz:
+        publisher_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "benchmark_rviz_publisher.py",
+        )
+        cmd = [sys.executable, publisher_script, "--output_dir", args.output_dir]
+        if args.map_a_path:
+            cmd += ["--map_a_path", args.map_a_path]
+        print(f"\nLaunching RViz publisher (Ctrl+C to stop):\n  {' '.join(cmd)}")
+        subprocess.run(cmd)
 
     return 0
 
