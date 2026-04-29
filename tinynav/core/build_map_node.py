@@ -29,6 +29,7 @@ from tqdm import tqdm
 import einops
 from tf2_msgs.msg import TFMessage
 from typing import Dict
+from collections import deque
 
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped,Point
@@ -276,7 +277,8 @@ class TinyNavDB():
             self.features[key] = features
 
     def get_depth_embedding_features_images(self, key:int):
-        return self.depths[key], self.embeddings[key], self.features[key], self.rgb_images[key], self.infra1_images[key]
+        rgb = self.rgb_images[key] if key in self.rgb_images else None
+        return self.depths[key], self.embeddings[key], self.features[key], rgb, self.infra1_images[key]
 
     def get_embedding(self, key:int):
         return self.embeddings[key]
@@ -417,7 +419,9 @@ class BuildMapNode(Node):
         self.depth_sub = Subscriber(self, Image, '/slam/keyframe_depth')
         self.keyframe_image_sub = Subscriber(self, Image, '/slam/keyframe_image')
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
-        self.rgb_image_sub = Subscriber(self, Image, '/camera/camera/color/image_raw')
+        # RGB image is optional — subscribe separately and cache by timestamp
+        self._rgb_image_cache: deque = deque(maxlen=200)
+        self.rgb_image_sub = self.create_subscription(Image, '/camera/camera/color/image_raw', self._rgb_image_callback, 100)
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/mapping/pointcloud_markers', 10)
@@ -431,8 +435,8 @@ class BuildMapNode(Node):
         # Add stop signal subscription and save finished publisher
         self.mapping_stop_sub = self.create_subscription(Bool, '/benchmark/stop', self.mapping_stop_callback, 10)
         self.mapping_save_finished_pub = self.create_publisher(Bool, '/benchmark/data_saved', 10)
-        # Keep sync queue bounded to reduce memory spikes/OOM risk on Jetson during map building.
-        self.ts = ApproximateTimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub, self.rgb_image_sub], 200, 0.02)
+        # 3-way sync on SLAM outputs only; RGB is looked up from cache by timestamp.
+        self.ts = ApproximateTimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub], 200, 0.02)
         self.ts.registerCallback(self.keyframe_callback)
 
         self.K = None
@@ -461,6 +465,21 @@ class BuildMapNode(Node):
         self.rgb_camera_info_sub = Subscriber(self, CameraInfo, "/camera/camera/color/camera_info")
         self.rgb_camera_info_sub.registerCallback(self.rgb_camera_info_callback)
         self.rgb_camera_K = None
+
+    def _rgb_image_callback(self, msg: Image):
+        timestamp_ns = int(msg.header.stamp.sec * 1e9) + int(msg.header.stamp.nanosec)
+        rgb_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        self._rgb_image_cache.append((timestamp_ns, rgb_image))
+
+    def _find_nearest_rgb(self, timestamp_ns: int):
+        if not self._rgb_image_cache:
+            return None
+        best_img, best_diff = None, float('inf')
+        for ts, img in self._rgb_image_cache:
+            diff = abs(ts - timestamp_ns)
+            if diff < best_diff:
+                best_diff, best_img = diff, img
+        return best_img if best_diff < 500_000_000 else None  # within 500 ms
 
     def tf_callback(self, msg:TFMessage):
         T_infra1_to_link = None
@@ -535,13 +554,15 @@ class BuildMapNode(Node):
                 save_finished_msg.data = False
                 self.mapping_save_finished_pub.publish(save_finished_msg)
 
-    def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg:Image):
+    def keyframe_callback(self, keyframe_image_msg: Image, keyframe_odom_msg: Odometry, depth_msg: Image):
         with Timer(name="Mapping Loop", text="[{name}] Elapsed time: {milliseconds:.0f} ms\n\n", logger=self.timer_logger):
             if self.K is None:
                 return
-            self.process(keyframe_image_msg, keyframe_odom_msg, depth_msg, rgb_image_msg)
+            timestamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
+            rgb_image = self._find_nearest_rgb(timestamp_ns)
+            self.process(keyframe_image_msg, keyframe_odom_msg, depth_msg, rgb_image)
 
-    def process(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg:Image):
+    def process(self, keyframe_image_msg: Image, keyframe_odom_msg: Odometry, depth_msg: Image, rgb_image: np.ndarray):
         with Timer(name = "Msg decode", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             keyframe_image_timestamp = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
             keyframe_odom_timestamp = int(keyframe_odom_msg.header.stamp.sec * 1e9) + int(keyframe_odom_msg.header.stamp.nanosec)
@@ -552,7 +573,7 @@ class BuildMapNode(Node):
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
             odom, _ = msg2np(keyframe_odom_msg)
             infra1_image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
-            rgb_image = self.bridge.imgmsg_to_cv2(rgb_image_msg, desired_encoding="bgr8")
+            # rgb_image already decoded (np.ndarray or None when RGB unavailable)
 
         with Timer(name = "save image and depth", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             self.db.set_entry(keyframe_image_timestamp, depth = depth, infra1_image = infra1_image, rgb_image = rgb_image)
@@ -816,6 +837,7 @@ def main(args=None):
     )
     rclpy.init(args=args)
 
+    from tinynav.core.perception_node import PerceptionNode
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--bag_file", type=str, default="tinynav_db")
@@ -828,13 +850,18 @@ def main(args=None):
     player_node = BagPlayer(parsed_args.bag_file)
     map_node = BuildMapNode(parsed_args.map_save_path, verbose_timer=parsed_args.verbose_timer)
     image_transports_node = ImageTransportsNode()
+    # PerceptionNode runs SLAM in the same executor so the bag plays at SLAM speed
+    # rather than racing ahead of a separate process.
+    slam_node = PerceptionNode(verbose_timer=False)
     exec_.add_node(player_node)
+    exec_.add_node(slam_node)
     exec_.add_node(map_node)
     exec_.add_node(image_transports_node)
     while rclpy.ok() and player_node.play_next():
         exec_.spin_once(timeout_sec=0.001)
     player_node._publish_percent(100.0)
     map_node.save_mapping()
+    slam_node.destroy_node()
 
 if __name__ == '__main__':
     main()
