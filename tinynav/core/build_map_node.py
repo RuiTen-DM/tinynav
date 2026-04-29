@@ -37,6 +37,7 @@ from scipy.spatial.transform import Rotation as R
 from scipy.ndimage import distance_transform_edt
 
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rosidl_runtime_py.utilities import get_message
 from rosgraph_msgs.msg import Clock
@@ -317,10 +318,18 @@ class BagPlayer(Node):
         # topic -> (publisher, msg_type)
         self._topic_publishers = {}
 
+        _TF_STATIC_QOS = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+
         # Build publishers for all topics in the bag
         for topic_info in topic_infos:
             msg_type = get_message(topic_info.type)
-            pub = self.create_publisher(msg_type, topic_info.name, 10)
+            qos = _TF_STATIC_QOS if topic_info.name == "/tf_static" else 10
+            pub = self.create_publisher(msg_type, topic_info.name, qos)
             self._topic_publishers[topic_info.name] = (pub, msg_type)
 
         self.get_logger().info("Bag topics and message types:")
@@ -457,9 +466,15 @@ class BuildMapNode(Node):
 
         self.map_save_path = map_save_path
         self._save_completed = False
+        _tf_static_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self.tf_sub = Subscriber(self, TFMessage, "/tf")
         self.tf_sub.registerCallback(self.tf_callback)
-        self.tf_static_sub = Subscriber(self, TFMessage, "/tf_static")
+        self.tf_static_sub = Subscriber(self, TFMessage, "/tf_static", qos_profile=_tf_static_qos)
         self.tf_static_sub.registerCallback(self.tf_callback)
         self.T_rgb_to_infra1 = None
         self.rgb_camera_info_sub = Subscriber(self, CameraInfo, "/camera/camera/color/camera_info")
