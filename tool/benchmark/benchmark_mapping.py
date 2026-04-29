@@ -324,6 +324,7 @@ def generate_launch_description_localization(
     data_saving_timeout: float,
     task_name: str,
     verbose_timer: bool,
+    ground_plane_constraint: bool,
 ):
     perception_cmd = [
         "python3",
@@ -333,6 +334,8 @@ def generate_launch_description_localization(
     ]
     if not verbose_timer:
         perception_cmd.append("--no_verbose_timer")
+    if ground_plane_constraint:
+        perception_cmd.append("--ground_plane_constraint")
 
     perception = ExecuteProcess(
         cmd=perception_cmd,
@@ -405,6 +408,7 @@ def generate_launch_description_mapping(
     data_saving_timeout: float,
     task_name: str,
     verbose_timer: bool,
+    ground_plane_constraint: bool,
 ):
     perception_cmd = [
         "python3",
@@ -414,6 +418,8 @@ def generate_launch_description_mapping(
     ]
     if not verbose_timer:
         perception_cmd.append("--no_verbose_timer")
+    if ground_plane_constraint:
+        perception_cmd.append("--ground_plane_constraint")
 
     perception = ExecuteProcess(
         cmd=perception_cmd,
@@ -927,9 +933,16 @@ def run_mapping_process(
     rate: float,
     data_saving_timeout: float,
     verbose_timer: bool,
+    ground_plane_constraint: bool,
 ) -> bool:
     ld = generate_launch_description_mapping(
-        bag_path, map_save_path, rate, data_saving_timeout, "mapping", verbose_timer,
+        bag_path,
+        map_save_path,
+        rate,
+        data_saving_timeout,
+        "mapping",
+        verbose_timer,
+        ground_plane_constraint,
     )
     ls = LaunchService()
     ls.include_launch_description(ld)
@@ -944,6 +957,7 @@ def run_localization_process(
     rate: float,
     data_saving_timeout: float,
     verbose_timer: bool,
+    ground_plane_constraint: bool,
 ) -> bool:
     ld = generate_launch_description_localization(
         bag_path,
@@ -953,6 +967,7 @@ def run_localization_process(
         data_saving_timeout,
         "localization",
         verbose_timer=verbose_timer,
+        ground_plane_constraint=ground_plane_constraint,
     )
     ls = LaunchService()
     ls.include_launch_description(ld)
@@ -969,6 +984,7 @@ def run_benchmark(
     timeout: float,
     verbose_timer: bool = False,
     map_a_path: Optional[str] = None,
+    ground_plane_constraint: bool = False,
 ) -> bool:
     """
     Run benchmark using timestamp-based sampling instead of keyframe-based.
@@ -989,6 +1005,7 @@ def run_benchmark(
     print(f"Bag B: {bag_b_path}")
     print(f"Playback rate: {rate}x")
     print(f"Number of samples: {num_samples}")
+    print(f"Frontend ground plane constraint: {ground_plane_constraint}")
 
     if map_a_path is not None:
         # Reuse an existing map directory; do not touch it.
@@ -1010,6 +1027,7 @@ def run_benchmark(
             rate=rate,
             data_saving_timeout=timeout,
             verbose_timer=verbose_timer,
+            ground_plane_constraint=ground_plane_constraint,
         ):
             print("Error: Failed to create map A")
             return False
@@ -1022,6 +1040,7 @@ def run_benchmark(
         rate=rate,
         data_saving_timeout=timeout,
         verbose_timer=verbose_timer,
+        ground_plane_constraint=ground_plane_constraint,
     ):
         print("Error: Failed to localize bag B in map A")
         return False
@@ -1131,6 +1150,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ground_plane_constraint",
+        action="store_true",
+        default=False,
+        help="Enable frontend ground-plane soft constraints in perception_node.py.",
+    )
+    parser.add_argument(
         "--rviz",
         action="store_true",
         default=False,
@@ -1169,6 +1194,7 @@ def main():
         args.timeout,
         args.verbose_timer,
         map_a_path=args.map_a_path,
+        ground_plane_constraint=args.ground_plane_constraint,
     )
     if benchmark_return:
         print("\nBenchmark completed!")

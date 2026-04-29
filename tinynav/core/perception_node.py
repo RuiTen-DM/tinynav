@@ -24,8 +24,10 @@ import gtsam
 import gtsam_unstable
 from collections import deque
 from dataclasses import dataclass
+from typing import Optional
 
 from gtsam.symbol_shorthand import X, B, V
+from tinynav.core.ground_plane import HorizontalGroundPlaneTracker, estimate_ground_plane_from_depth
 
 _N = 5
 _M = 1000
@@ -80,12 +82,20 @@ class Keyframe:
     bias: gtsam.imuBias.ConstantBias
     preintegrated_imu: gtsam.PreintegratedCombinedMeasurements
     latest_imu_timestamp: float
+    ground_plane: Optional[dict] = None
     imu_measurement_count: int = 0
 
 class PerceptionNode(Node):
-    def __init__(self, verbose_timer: bool = True):
+    def __init__(
+        self,
+        verbose_timer: bool = True,
+        enable_ground_plane_constraint: bool = False,
+        ground_plane_mode: str = "horizontal",
+    ):
         super().__init__("perception_node")
         self.verbose_timer = verbose_timer
+        self.enable_ground_plane_constraint = enable_ground_plane_constraint
+        self.ground_plane_mode = ground_plane_mode
         self.logger = logging.getLogger(__name__)
         # self.timer_logger = self.logger.info if verbose_timer else self.logger.debug
         # model
@@ -167,7 +177,12 @@ class PerceptionNode(Node):
         self.imu_measurements = deque(maxlen=1000)
 
         self.keyframe_queue = []
+        self.ground_plane_tracker = HorizontalGroundPlaneTracker()
+        # Pose3 tangent sigmas: weak yaw/x/y, tighter roll/pitch/z for horizontal-ground stabilization.
+        self.ground_plane_prior_sigmas = np.array([0.06, 0.06, 10.0, 10.0, 10.0, 0.12])
         self.logger.info("PerceptionNode initialized.")
+        if self.enable_ground_plane_constraint:
+            self.logger.info(f"Ground plane frontend constraint enabled: mode={self.ground_plane_mode}")
         self.process_cnt = 0
 
     def info_callback(self, msg):
@@ -179,6 +194,65 @@ class PerceptionNode(Node):
             self.get_logger().info(f"Camera intrinsics and baseline received. Baseline: {self.baseline:.4f}m")
             self.camera_info_msg = msg
             self.destroy_subscription(self.camerainfo_sub)
+
+    def estimate_current_ground_plane(self, depth: np.ndarray) -> Optional[dict]:
+        if not self.enable_ground_plane_constraint:
+            return None
+        return estimate_ground_plane_from_depth(depth, self.K)
+
+    def add_ground_plane_prior(self, graph, pose_key, keyframe: Keyframe) -> bool:
+        if not self.enable_ground_plane_constraint or keyframe.ground_plane is None:
+            return False
+        prior_pose, ground_stats = self.ground_plane_tracker.make_prior_pose(
+            keyframe.ground_plane,
+            keyframe.pose,
+        )
+        if prior_pose is None:
+            self.logger.debug(
+                f"Skip ground plane prior at {keyframe.timestamp}: {ground_stats['reason']}"
+            )
+            return False
+
+        noise = gtsam.noiseModel.Diagonal.Sigmas(self.ground_plane_prior_sigmas)
+        graph.add(gtsam.PriorFactorPose3(pose_key, Matrix4x4ToGtsamPose3(prior_pose), noise))
+        self.logger.debug(
+            "Added ground plane prior "
+            f"timestamp={keyframe.timestamp}, tilt={ground_stats['tilt_deg']:.2f}deg, "
+            f"height_delta={ground_stats['height_delta']:.3f}m"
+        )
+        return True
+
+    def _publish_depth_outputs(self, disparity: np.ndarray, depth: np.ndarray, header) -> Image:
+        disp_vis = disparity.copy().astype(np.uint8)
+        disp_color = cv2.applyColorMap(disp_vis * 4, cv2.COLORMAP_PLASMA)
+        disp_color_msg = self.bridge.cv2_to_imgmsg(disp_color, encoding='bgr8')
+        disp_color_msg.header = header
+        self.disparity_pub_vis.publish(disp_color_msg)
+
+        depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding="32FC1")
+        depth_msg.header.stamp = header.stamp
+        depth_msg.header.frame_id = "camera"
+        self.camera_info_msg.header.stamp = header.stamp
+        self.camera_info_msg.header.frame_id = "camera"
+        self.slam_camera_info_pub.publish(self.camera_info_msg)
+        self.depth_pub.publish(depth_msg)
+        return depth_msg
+
+    def _publish_odometry_outputs(self, pose: np.ndarray, velocity: np.ndarray, stamp) -> None:
+        self.odom_pub.publish(np2msg(pose, stamp, "world", "camera", velocity))
+        self.tf_broadcaster.sendTransform(np2tf(pose, stamp, "world", "camera"))
+
+    def _publish_keyframe_outputs(
+        self,
+        pose: np.ndarray,
+        velocity: np.ndarray,
+        stamp,
+        image_msg: Image,
+        depth_msg: Image,
+    ) -> None:
+        self.keyframe_pose_pub.publish(np2msg(pose, stamp, "world", "camera", velocity))
+        self.keyframe_image_pub.publish(image_msg)
+        self.keyframe_depth_pub.publish(depth_msg)
 
     def _process_imu_msg(self, imu_msg):
         current_timestamp = stamp2second(imu_msg.header.stamp)
@@ -247,6 +321,7 @@ class PerceptionNode(Node):
         current_timestamp = stamp2second(left_msg.header.stamp)
         if len(self.keyframe_queue) == 0: # first frame
             disparity, depth = await self.stereo_engine.infer(left_img, right_img, np.array([[self.baseline]]), np.array([[self.K[0,0]]]))
+            ground_plane = self.estimate_current_ground_plane(depth)
             self.keyframe_queue.append(
                 Keyframe(
                     timestamp=current_timestamp,
@@ -257,16 +332,42 @@ class PerceptionNode(Node):
                     velocity=np.zeros(3),
                     bias=gtsam.imuBias.ConstantBias(),
                     preintegrated_imu=gtsam.PreintegratedCombinedMeasurements(self.pre_integration_params, gtsam.imuBias.ConstantBias()),
-                    latest_imu_timestamp=current_timestamp
+                    latest_imu_timestamp=current_timestamp,
+                    ground_plane=ground_plane,
                 )
             )
+            if self.enable_ground_plane_constraint:
+                self.ground_plane_tracker.observe(ground_plane, self.T_body_last)
+            depth_msg = self._publish_depth_outputs(disparity, depth, left_msg.header)
+            self._publish_odometry_outputs(self.T_body_last, np.zeros(3), left_msg.header.stamp)
+            self._publish_keyframe_outputs(
+                self.T_body_last,
+                np.zeros(3),
+                left_msg.header.stamp,
+                left_msg,
+                depth_msg,
+            )
             return {
-            "stats": {"process_cnt": 0},
-            "metrics": {"num_keyframes": 0, "num_tracks": 0, "num_factors": 0, "num_variables": 0, "initial_error": 0.0, "final_error": 0.0}
-        }
+                "stats": {"process_cnt": self.process_cnt},
+                "metrics": {
+                    "num_keyframes": len(self.keyframe_queue),
+                    "num_tracks": 0,
+                    "num_factors": 0,
+                    "num_variables": 0,
+                    "num_ground_priors": 0,
+                    "ground_plane_enabled": self.enable_ground_plane_constraint,
+                    "pnp_success": None,
+                    "pnp_matches": 0,
+                    "pnp_inliers": 0,
+                    "published_keyframe": True,
+                    "initial_error": 0.0,
+                    "final_error": 0.0,
+                },
+            }
 
         with Timer(name="[Stereo Inference]", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.logger.debug):
             disparity, depth = await self.stereo_engine.infer(left_img, right_img, np.array([[self.baseline]]), np.array([[self.K[0,0]]]))
+            current_ground_plane = self.estimate_current_ground_plane(depth)
             kf_prev = self.keyframe_queue[-1]
             prev_left_extract_result = await self.superpoint.infer(kf_prev.image)
             current_left_extract_result = await self.superpoint.infer(left_img)
@@ -314,13 +415,16 @@ class PerceptionNode(Node):
             kpt_cur = current_keypoints[match_indices[valid_mask]]
             idx_valid = np.array(idx_to_origial)[valid_mask]
             logging.debug(f"match cnt: {len(kpt_pre)}")
-            state, T_kf_curr, _, _, _ = estimate_pose(
+            state, T_kf_curr, _, _, pnp_inliers = estimate_pose(
                 kpt_pre,
                 kpt_cur,
                 depth,
                 self.K,
                 idx_valid
             )
+            pnp_inlier_count = len(pnp_inliers)
+            if not state:
+                self.logger.warning(f"PnP failed with {len(kpt_pre)} matches; using identity relative pose")
             self.logger.debug("Estimated T_kf_curr:\n", T_kf_curr)
         # for new frame, we first add it as keyframe, if not, we pop it later
         self.keyframe_queue.append(
@@ -333,9 +437,12 @@ class PerceptionNode(Node):
                 velocity=self.keyframe_queue[-1].velocity,
                 bias=gtsam.imuBias.ConstantBias(),
                 preintegrated_imu=gtsam.PreintegratedCombinedMeasurements(self.pre_integration_params, gtsam.imuBias.ConstantBias()),
-                latest_imu_timestamp=current_timestamp
+                latest_imu_timestamp=current_timestamp,
+                ground_plane=current_ground_plane,
             )
         )
+        if self.enable_ground_plane_constraint:
+            self.ground_plane_tracker.observe(current_ground_plane, self.keyframe_queue[-1].pose)
         if len(self.keyframe_queue) > _N:
             self.keyframe_queue.pop(0)
         with Timer(name="[ISAM Processing]", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.logger.info):
@@ -343,6 +450,7 @@ class PerceptionNode(Node):
                 # we have new graph each time
                 graph = gtsam.NonlinearFactorGraph()
                 initial_estimate = gtsam.Values()
+                ground_prior_count = 0
                 # process previous keyframes' factors
                 for i, keyframe in enumerate(self.keyframe_queue[-_N:]):
                     # per pose -- bias
@@ -351,6 +459,8 @@ class PerceptionNode(Node):
 
                     initial_estimate.insert(V(i), keyframe.velocity)
                     initial_estimate.insert(X(i), Matrix4x4ToGtsamPose3(keyframe.pose))
+                    if self.add_ground_plane_prior(graph, X(i), keyframe):
+                        ground_prior_count += 1
                     if i == 0:
                         ## per pose -- velocity
                         #graph.add(gtsam.PriorFactorVector(V(i), np.zeros(3), gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-2, 1e-2, 1e-2]))))
@@ -525,22 +635,8 @@ class PerceptionNode(Node):
                 self.logger.debug(f"Bias {i} updated:\n{result.atConstantBias(B(i))}")
                 #print("imu error: ", keyframe.preintegrated_imu.error(initial_estimate))
 
-        with Timer(text="[Depth as Color] Elapsed time: {milliseconds:.0f} ms", logger=self.logger.debug):
-            disp_vis = disparity.copy().astype(np.uint8)
-            disp_color = cv2.applyColorMap(disp_vis * 4, cv2.COLORMAP_PLASMA)
-            disp_color_msg = self.bridge.cv2_to_imgmsg(disp_color, encoding='bgr8')
-            disp_color_msg.header = left_msg.header
-            self.disparity_pub_vis.publish(disp_color_msg)
-
-        with Timer(name='[Depth as Cloud', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.logger.debug):
-            # publish depth image and camera info for depth topic (required by DepthCloud)
-            depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding="32FC1")
-            depth_msg.header.stamp = left_msg.header.stamp
-            depth_msg.header.frame_id = "camera"  # Match TF frame
-            self.camera_info_msg.header.stamp = left_msg.header.stamp
-            self.camera_info_msg.header.frame_id = "camera"  # Match TF frame
-            self.slam_camera_info_pub.publish(self.camera_info_msg)
-            self.depth_pub.publish(depth_msg)
+        with Timer(name="[Depth Publish]", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.logger.debug):
+            depth_msg = self._publish_depth_outputs(disparity, depth, left_msg.header)
         self.logger.debug(f"superpoint cache info: {self.superpoint.infer.cache_info()}")
         self.logger.debug(f"lightglue cache info: {self.light_glue.infer.cache_info()}")
         self.logger.debug(f"estimate_pose cache info: {estimate_pose.cache_info()}")
@@ -548,17 +644,20 @@ class PerceptionNode(Node):
         with Timer(name="[Publish Odometry]", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.logger.debug):
             self.T_body_last = result.atPose3(X(len(self.keyframe_queue) - 1)).matrix()
             self.V_last = result.atVector(V(len(self.keyframe_queue) - 1))
-            # publish odometry
-            self.odom_pub.publish(np2msg(self.T_body_last, left_msg.header.stamp, "world", "camera", self.V_last))
-            # publish TF
-            self.tf_broadcaster.sendTransform(np2tf(self.T_body_last, left_msg.header.stamp, "world", "camera"))
+            self._publish_odometry_outputs(self.T_body_last, self.V_last, left_msg.header.stamp)
 
             last_keyframe = self.keyframe_queue[-2]
             current_keyframe = self.keyframe_queue[-1]
+            published_keyframe = False
             if keyframe_check(last_keyframe.pose, current_keyframe.pose) or current_keyframe.timestamp - last_keyframe.timestamp > 3.0:
-                self.keyframe_pose_pub.publish(np2msg(current_keyframe.pose, left_msg.header.stamp, "world", "camera", current_keyframe.velocity))
-                self.keyframe_image_pub.publish(left_msg)
-                self.keyframe_depth_pub.publish(depth_msg)
+                self._publish_keyframe_outputs(
+                    current_keyframe.pose,
+                    current_keyframe.velocity,
+                    left_msg.header.stamp,
+                    left_msg,
+                    depth_msg,
+                )
+                published_keyframe = True
             else:
                 self.keyframe_queue.pop()
 
@@ -571,6 +670,12 @@ class PerceptionNode(Node):
                 "num_tracks": len(tracks),
                 "num_factors": graph.size(),
                 "num_variables": initial_estimate.size(),
+                "num_ground_priors": ground_prior_count,
+                "ground_plane_enabled": self.enable_ground_plane_constraint,
+                "pnp_success": bool(state),
+                "pnp_matches": int(len(kpt_pre)),
+                "pnp_inliers": int(pnp_inlier_count),
+                "published_keyframe": published_keyframe,
                 "initial_error": graph.error(initial_estimate),
                 "final_error": graph.error(result),
             },
@@ -585,6 +690,24 @@ def main(args=None):
     parser.add_argument("--verbose_timer", action="store_true", help="Enable verbose timer output")
     parser.add_argument("--no_verbose_timer", dest="verbose_timer", action="store_false", help="Disable verbose timer output")
     parser.add_argument("--log_file", type=str, default="odom.log", help="Path to the log file")
+    parser.add_argument(
+        "--ground_plane_constraint",
+        action="store_true",
+        default=False,
+        help="Enable frontend ground-plane soft constraints in the visual-inertial graph.",
+    )
+    parser.add_argument(
+        "--no_ground_plane_constraint",
+        dest="ground_plane_constraint",
+        action="store_false",
+        help="Disable frontend ground-plane constraints.",
+    )
+    parser.add_argument(
+        "--ground_plane_mode",
+        choices=("horizontal",),
+        default="horizontal",
+        help="Ground-plane frontend constraint mode.",
+    )
     parsed_args, unknown_args = parser.parse_known_args(sys.argv[1:])
     print(f"Verbose timer: {parsed_args.verbose_timer}")
 
@@ -595,7 +718,11 @@ def main(args=None):
         handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(parsed_args.log_file)],
     )
 
-    perception_node = PerceptionNode(verbose_timer=parsed_args.verbose_timer)
+    perception_node = PerceptionNode(
+        verbose_timer=parsed_args.verbose_timer,
+        enable_ground_plane_constraint=parsed_args.ground_plane_constraint,
+        ground_plane_mode=parsed_args.ground_plane_mode,
+    )
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(perception_node)

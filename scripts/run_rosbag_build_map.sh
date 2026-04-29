@@ -5,11 +5,15 @@ rosbag_path=$(uv run hf download --repo-type dataset --cache-dir /tinynav Unifle
 map_save_path=/tinynav/output/map_go2_looper
 
 mode="${1:-perception}" # looper_direct | perception
+ground_plane_args=""
+if [[ "${GROUND_PLANE_CONSTRAINT:-0}" == "1" ]]; then
+  ground_plane_args="--ground_plane_constraint"
+fi
 
 if [[ "${mode}" == "looper_direct" ]]; then
   source_cmd='uv run python /tinynav/tool/looper_bridge_node.py'
 elif [[ "${mode}" == "perception" ]]; then
-  source_cmd='uv run python /tinynav/tinynav/core/perception_node.py'
+  source_cmd="uv run python /tinynav/tinynav/core/perception_node.py ${ground_plane_args}"
 else
   echo "Usage: $0 [looper_direct|perception]"
   exit 1

@@ -20,6 +20,7 @@ import argparse
 import sys
 
 from tinynav.tinynav_cpp_bind import pose_graph_solve
+from tinynav.core.ground_plane import apply_ground_plane_constraint, estimate_ground_plane_from_depth
 from tinynav.core.models_trt import LightGlueTRT, Dinov2TRT, SuperPointTRT
 from tinynav.core.planning_node import run_raycasting_loopy
 import logging
@@ -46,294 +47,24 @@ from rclpy.serialization import deserialize_message
 
 logger = logging.getLogger(__name__)
 
-
-def _normalize_vector(vec: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(vec)
-    if norm < 1e-8:
-        return vec
-    return vec / norm
-
-
-def _rotation_from_two_vectors(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    src = _normalize_vector(src.astype(np.float64))
-    dst = _normalize_vector(dst.astype(np.float64))
-    cross = np.cross(src, dst)
-    cross_norm = np.linalg.norm(cross)
-    dot = float(np.clip(np.dot(src, dst), -1.0, 1.0))
-    if cross_norm < 1e-8:
-        if dot > 0.0:
-            return np.eye(3)
-        axis = np.cross(src, np.array([1.0, 0.0, 0.0]))
-        if np.linalg.norm(axis) < 1e-8:
-            axis = np.cross(src, np.array([0.0, 1.0, 0.0]))
-        axis = _normalize_vector(axis)
-        return R.from_rotvec(np.pi * axis).as_matrix()
-    axis = cross / cross_norm
-    angle = np.arctan2(cross_norm, dot)
-    return R.from_rotvec(angle * axis).as_matrix()
+_BAG_REPLAY_BLOCKED_TOPICS = {
+    "/slam/odometry",
+    "/slam/depth",
+    "/slam/disparity_vis",
+    "/slam/camera_info",
+}
+_BAG_REPLAY_BLOCKED_PREFIXES = (
+    "/mapping/",
+    "/planning/",
+    "/control/",
+)
 
 
-def _fit_plane_pca(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
-    centroid = np.mean(points, axis=0)
-    centered = points - centroid
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    normal = _normalize_vector(vh[-1])
-    offset = -float(np.dot(normal, centroid))
-    return normal.astype(np.float64), offset, centroid.astype(np.float64)
+def should_replay_bag_topic(topic_name: str) -> bool:
+    if topic_name in _BAG_REPLAY_BLOCKED_TOPICS:
+        return False
+    return not any(topic_name.startswith(prefix) for prefix in _BAG_REPLAY_BLOCKED_PREFIXES)
 
-
-def fit_plane_ransac_pca(
-    points: np.ndarray,
-    distance_threshold: float,
-    max_iterations: int,
-    min_inliers: int,
-    rng_seed: int = 0,
-) -> Optional[dict]:
-    if points.shape[0] < max(3, min_inliers):
-        return None
-
-    points = points.astype(np.float64, copy=False)
-    rng = np.random.default_rng(rng_seed)
-    best_inliers = None
-    best_count = 0
-    best_median_error = np.inf
-    point_count = points.shape[0]
-
-    for _ in range(max_iterations):
-        sample_idx = rng.choice(point_count, size=3, replace=False)
-        p0, p1, p2 = points[sample_idx]
-        normal = np.cross(p1 - p0, p2 - p0)
-        normal_norm = np.linalg.norm(normal)
-        if normal_norm < 1e-8:
-            continue
-        normal = normal / normal_norm
-        offset = -float(np.dot(normal, p0))
-        distances = np.abs(points @ normal + offset)
-        inliers = distances < distance_threshold
-        count = int(np.count_nonzero(inliers))
-        if count < min_inliers:
-            continue
-        median_error = float(np.median(distances[inliers]))
-        if count > best_count or (count == best_count and median_error < best_median_error):
-            best_inliers = inliers
-            best_count = count
-            best_median_error = median_error
-
-    if best_inliers is None:
-        return None
-
-    inlier_points = points[best_inliers]
-    normal, offset, centroid = _fit_plane_pca(inlier_points)
-    distances = np.abs(points @ normal + offset)
-    refined_inliers = distances < distance_threshold
-    refined_count = int(np.count_nonzero(refined_inliers))
-    if refined_count >= min_inliers:
-        inlier_points = points[refined_inliers]
-        normal, offset, centroid = _fit_plane_pca(inlier_points)
-        best_inliers = refined_inliers
-        best_count = refined_count
-
-    return {
-        "normal": normal.astype(np.float32),
-        "offset": float(offset),
-        "centroid": centroid.astype(np.float32),
-        "inlier_count": best_count,
-        "inlier_ratio": float(best_count / point_count),
-    }
-
-
-def sample_ground_candidates_from_depth(
-    depth: np.ndarray,
-    K: np.ndarray,
-    step: int = 12,
-    max_distance: float = 8.0,
-    min_distance: float = 0.2,
-    min_camera_y: float = 0.05,
-    min_v_fraction: float = 0.40,
-    max_points: int = 5000,
-) -> np.ndarray:
-    h, w = depth.shape
-    v_start = int(h * min_v_fraction)
-    us = np.arange(0, w, step, dtype=np.float32)
-    vs = np.arange(v_start, h, step, dtype=np.float32)
-    if us.size == 0 or vs.size == 0:
-        return np.empty((0, 3), dtype=np.float32)
-
-    uu, vv = np.meshgrid(us, vs)
-    z = depth[vv.astype(np.int32), uu.astype(np.int32)].astype(np.float32)
-    valid = np.isfinite(z) & (z >= min_distance) & (z <= max_distance)
-    if not np.any(valid):
-        return np.empty((0, 3), dtype=np.float32)
-
-    z = z[valid]
-    uu = uu[valid]
-    vv = vv[valid]
-    x = (uu - K[0, 2]) * z / K[0, 0]
-    y = (vv - K[1, 2]) * z / K[1, 1]
-    points = np.stack((x, y, z), axis=1)
-    points = points[points[:, 1] > min_camera_y]
-    if points.shape[0] > max_points:
-        indices = np.linspace(0, points.shape[0] - 1, max_points).astype(np.int32)
-        points = points[indices]
-    return points.astype(np.float32)
-
-
-def estimate_ground_plane_from_depth(depth: np.ndarray, K: np.ndarray) -> Optional[dict]:
-    points = sample_ground_candidates_from_depth(depth, K)
-    plane = fit_plane_ransac_pca(
-        points,
-        distance_threshold=0.04,
-        max_iterations=96,
-        min_inliers=120,
-        rng_seed=17,
-    )
-    if plane is None or plane["inlier_ratio"] < 0.20:
-        return None
-
-    # Camera optical frame has +Y downward; orient the ground normal roughly upward.
-    if plane["normal"][1] > 0.0:
-        plane["normal"] = -plane["normal"]
-        plane["offset"] = -plane["offset"]
-    return plane
-
-
-def _transform_plane_to_world(plane: dict, pose: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
-    normal = pose[:3, :3] @ plane["normal"].astype(np.float64)
-    normal = _normalize_vector(normal)
-    centroid = pose[:3, :3] @ plane["centroid"].astype(np.float64) + pose[:3, 3]
-    offset = float(plane["offset"] - np.dot(normal, pose[:3, 3]))
-    return normal, offset, centroid
-
-
-def estimate_global_ground_plane(poses: dict, ground_planes: dict) -> Optional[dict]:
-    centroids = []
-    normals = []
-    for timestamp, plane in ground_planes.items():
-        if timestamp not in poses:
-            continue
-        normal, _, centroid = _transform_plane_to_world(plane, poses[timestamp])
-        centroids.append(centroid)
-        normals.append(normal)
-
-    if len(centroids) < 3:
-        return None
-
-    centroids = np.asarray(centroids, dtype=np.float64)
-    normals = np.asarray(normals, dtype=np.float64)
-    reference_normal = normals[0]
-    for i in range(normals.shape[0]):
-        if np.dot(normals[i], reference_normal) < 0.0:
-            normals[i] = -normals[i]
-    mean_normal = _normalize_vector(np.mean(normals, axis=0))
-    if np.linalg.norm(mean_normal) < 1e-8:
-        return None
-
-    plane = fit_plane_ransac_pca(
-        centroids,
-        distance_threshold=0.08,
-        max_iterations=128,
-        min_inliers=max(3, int(0.35 * len(centroids))),
-        rng_seed=23,
-    )
-
-    if plane is not None:
-        normal = plane["normal"].astype(np.float64)
-        if np.dot(normal, mean_normal) < 0.0:
-            normal = -normal
-        # Straight-line trajectories can make centroid-only plane fitting ill-conditioned.
-        if np.dot(normal, mean_normal) > np.cos(np.deg2rad(45.0)):
-            mean_normal = _normalize_vector(normal + mean_normal)
-
-    offsets = -(centroids @ mean_normal)
-    offset = float(np.median(offsets))
-    distances = np.abs(centroids @ mean_normal + offset)
-    inliers = distances < 0.08
-    if np.count_nonzero(inliers) >= max(3, int(0.35 * len(centroids))):
-        offset = float(np.median(offsets[inliers]))
-        centroid = np.mean(centroids[inliers], axis=0)
-        inlier_count = int(np.count_nonzero(inliers))
-    else:
-        centroid = np.mean(centroids, axis=0)
-        inlier_count = len(centroids)
-
-    plane = {
-        "normal": mean_normal.astype(np.float32),
-        "offset": offset,
-        "centroid": centroid.astype(np.float32),
-        "inlier_count": inlier_count,
-        "inlier_ratio": float(inlier_count / len(centroids)),
-    }
-    plane["source_count"] = len(centroids)
-    return plane
-
-
-def apply_ground_plane_constraint(
-    poses: dict,
-    ground_planes: dict,
-    max_tilt_correction_deg: float = 12.0,
-    max_height_correction: float = 0.60,
-) -> tuple[dict, dict]:
-    global_plane = estimate_global_ground_plane(poses, ground_planes)
-    stats = {
-        "enabled": True,
-        "global_plane": global_plane,
-        "corrected_count": 0,
-        "skipped_no_plane": 0,
-        "skipped_tilt": 0,
-        "skipped_height": 0,
-        "tilt_correction_deg": [],
-        "height_correction": [],
-    }
-    if global_plane is None:
-        stats["enabled"] = False
-        return poses, stats
-
-    global_normal = global_plane["normal"].astype(np.float64)
-    global_normal = _normalize_vector(global_normal)
-    global_offset = float(global_plane["offset"])
-    max_tilt_rad = np.deg2rad(max_tilt_correction_deg)
-    corrected_poses = {}
-
-    for timestamp, pose in poses.items():
-        plane = ground_planes.get(timestamp)
-        if plane is None:
-            corrected_poses[timestamp] = pose
-            stats["skipped_no_plane"] += 1
-            continue
-
-        normal_cam = plane["normal"].astype(np.float64)
-        offset_cam = float(plane["offset"])
-        normal_world = pose[:3, :3] @ normal_cam
-        normal_world = _normalize_vector(normal_world)
-        if np.dot(normal_world, global_normal) < 0.0:
-            normal_cam = -normal_cam
-            offset_cam = -offset_cam
-            normal_world = -normal_world
-
-        tilt = float(np.arccos(np.clip(np.dot(normal_world, global_normal), -1.0, 1.0)))
-        if tilt > max_tilt_rad:
-            corrected_poses[timestamp] = pose
-            stats["skipped_tilt"] += 1
-            continue
-
-        height_delta = float(offset_cam - np.dot(global_normal, pose[:3, 3]) - global_offset)
-        if abs(height_delta) > max_height_correction:
-            corrected_poses[timestamp] = pose
-            stats["skipped_height"] += 1
-            continue
-
-        corrected_pose = pose.copy()
-        correction_rot = _rotation_from_two_vectors(normal_world, global_normal)
-        corrected_pose[:3, :3] = correction_rot @ pose[:3, :3]
-        corrected_pose[:3, 3] = pose[:3, 3] + height_delta * global_normal
-        corrected_poses[timestamp] = corrected_pose
-        stats["corrected_count"] += 1
-        stats["tilt_correction_deg"].append(float(np.rad2deg(tilt)))
-        stats["height_correction"].append(height_delta)
-
-    stats["tilt_correction_deg"] = np.asarray(stats["tilt_correction_deg"], dtype=np.float32)
-    stats["height_correction"] = np.asarray(stats["height_correction"], dtype=np.float32)
-    return corrected_poses, stats
 
 def z_value_to_color(z, z_min, z_max):
     color = ColorRGBA(r=0.0, g=0.0, b=0.0, a=1.0)
@@ -398,6 +129,8 @@ def generate_occupancy_map(poses, db, K, baseline, resolution = 0.1, step = 100)
             1 : Free
             2 : Occupied
     """
+    if len(poses) == 0:
+        raise ValueError("Cannot generate occupancy map without keyframe poses.")
     raycast_shape = (100, 100, 20)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     odom_pose_min_position = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
@@ -583,6 +316,7 @@ class TinyNavDB():
 class BagPlayer(Node):
     def __init__(self, bag_uri: str, storage_id: str = "sqlite3", serialization_format: str = "cdr",
                  realtime_rate: float = 0.0,
+                 replay_all_topics: bool = False,
     ):
         super().__init__("rosbag_player")
 
@@ -614,16 +348,22 @@ class BagPlayer(Node):
 
         # topic -> (publisher, msg_type)
         self._topic_publishers = {}
+        self._skipped_topics = set()
 
-        # Build publishers for all topics in the bag
+        # Build publishers for sensor/keyframe inputs. Recorded runtime outputs
+        # can collide with live perception/map outputs during offline map builds.
         for topic_info in topic_infos:
+            if not replay_all_topics and not should_replay_bag_topic(topic_info.name):
+                self._skipped_topics.add(topic_info.name)
+                continue
             msg_type = get_message(topic_info.type)
             pub = self.create_publisher(msg_type, topic_info.name, 10)
             self._topic_publishers[topic_info.name] = (pub, msg_type)
 
         self.get_logger().info("Bag topics and message types:")
         for topic_info in sorted(topic_infos, key=lambda t: t.name):
-            self.get_logger().info(f"  {topic_info.name} -> {topic_info.type}")
+            suffix = " (skipped recorded output)" if topic_info.name in self._skipped_topics else ""
+            self.get_logger().info(f"  {topic_info.name} -> {topic_info.type}{suffix}")
 
         # /clock publisher (for use_sim_time)
         self._clock_pub = self.create_publisher(Clock, "/clock", 10)
@@ -694,6 +434,13 @@ class BagPlayer(Node):
         # Find publisher + msg type for this topic
         pub_and_type = self._topic_publishers.get(topic)
         if pub_and_type is None:
+            if self._clock_pub is not None:
+                clock_msg = Clock()
+                clock_msg.clock.sec = int(timestamp_ns // 1_000_000_000)
+                clock_msg.clock.nanosec = int(timestamp_ns % 1_000_000_000)
+                self._clock_pub.publish(clock_msg)
+            if topic in self._skipped_topics:
+                return True
             # No publisher (should not really happen, but don't crash playback)
             self.get_logger().warn(f"No publisher for topic '{topic}'")
             return True
@@ -792,6 +539,7 @@ class BuildMapNode(Node):
             self.rgb_camera_info_sub.registerCallback(self.rgb_camera_info_callback)
         else:
             self.rgb_camera_info_sub = None
+        self.last_keyframe_wall_time = None
 
     def tf_callback(self, msg:TFMessage):
         T_infra1_to_link = None
@@ -880,6 +628,7 @@ class BuildMapNode(Node):
             self.process(keyframe_image_msg, keyframe_odom_msg, depth_msg, None)
 
     def process(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg):
+        self.last_keyframe_wall_time = time.monotonic()
         with Timer(name = "Msg decode", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             keyframe_image_timestamp = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
             keyframe_odom_timestamp = int(keyframe_odom_msg.header.stamp.sec * 1e9) + int(keyframe_odom_msg.header.stamp.nanosec)
@@ -1007,6 +756,15 @@ class BuildMapNode(Node):
 
         with Timer(name = "final pose graph", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             self.pose_graph_used_pose = solve_pose_graph(self.pose_graph_used_pose, self.relative_pose_constraint)
+
+        if len(self.pose_graph_used_pose) == 0:
+            self.db.close()
+            raise RuntimeError(
+                "No keyframe poses were recorded. build_map_node consumes "
+                "/slam/keyframe_image, /slam/keyframe_odom and /slam/keyframe_depth; "
+                "run perception_node.py concurrently, or replay a bag that already contains "
+                "those keyframe topics."
+            )
 
         if self.enable_ground_plane_constraint:
             with Timer(name = "ground plane constraint", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
@@ -1190,6 +948,19 @@ def main(args=None):
                         help="If >0, pace BagPlayer against wall clock at this rate (1.0 = real-time). "
                              "Default 0 keeps legacy max-throughput playback.")
     parser.add_argument(
+        "--post_play_spin_seconds",
+        type=float,
+        default=10.0,
+        help="Keep spinning after rosbag playback reaches EOF so slower perception_node output can arrive.",
+    )
+    parser.add_argument(
+        "--replay_all_topics",
+        action="store_true",
+        default=False,
+        help="Replay all bag topics, including recorded /slam, /mapping, and /planning outputs. "
+             "Default filters those outputs to avoid collisions with live nodes.",
+    )
+    parser.add_argument(
         "--ground_plane_constraint",
         action="store_true",
         default=True,
@@ -1204,7 +975,11 @@ def main(args=None):
     parsed_args, unknown_args = parser.parse_known_args(sys.argv[1:])
 
     exec_ = SingleThreadedExecutor()
-    player_node = BagPlayer(parsed_args.bag_file, realtime_rate=parsed_args.realtime_rate)
+    player_node = BagPlayer(
+        parsed_args.bag_file,
+        realtime_rate=parsed_args.realtime_rate,
+        replay_all_topics=parsed_args.replay_all_topics,
+    )
     bag_topics = set(player_node._topic_publishers.keys())
     has_rgb = '/camera/camera/color/image_raw' in bag_topics or '/camera/camera/color/image_rect_raw/compressed' in bag_topics
     has_compressed_rgb = '/camera/camera/color/image_rect_raw/compressed' in bag_topics
@@ -1224,6 +999,15 @@ def main(args=None):
     while rclpy.ok() and player_node.play_next():
         exec_.spin_once(timeout_sec=0.001)
     player_node._publish_percent(100.0)
+    post_spin_deadline = time.monotonic() + max(0.0, parsed_args.post_play_spin_seconds)
+    while rclpy.ok() and time.monotonic() < post_spin_deadline:
+        exec_.spin_once(timeout_sec=0.05)
+        if (
+            len(map_node.pose_graph_used_pose) > 0
+            and map_node.last_keyframe_wall_time is not None
+            and time.monotonic() - map_node.last_keyframe_wall_time > 1.0
+        ):
+            break
     map_node.save_mapping()
 
 if __name__ == '__main__':
